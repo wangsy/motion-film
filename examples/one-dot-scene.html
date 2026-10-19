@@ -1,0 +1,285 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#0E0F13}canvas{display:block}</style></head>
+<body><canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// Every value is a function of the frame number f (float allowed for motion-blur subframes).
+const W = 1920, H = 1080, CX = 960, CY = 540;
+const C = { ink: '#0E0F13', paper: '#F2EFE8', coral: '#FF5A3C', cobalt: '#3B5BFF', mint: '#2ED3A0', graphite: '#24262D' };
+const FONT = '"Avenir Next", "Helvetica Neue", sans-serif';
+const canvas = document.getElementById('c'), out = canvas.getContext('2d');
+const buf = document.createElement('canvas'); buf.width = W; buf.height = H; const g = buf.getContext('2d');
+let T = null; // timing.json, injected
+
+// ---------- eases / helpers ----------
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const eOut = t => 1 - (1 - t) ** 4;                      // arrive slow
+const eIn = t => t ** 3;                                 // leave fast
+const eIO = t => t < .5 ? 8 * t ** 4 : 1 - (-2 * t + 2) ** 4 / 2;
+const expoOut = t => t >= 1 ? 1 : 1 - 2 ** (-10 * t);
+const spring = (t, k = 7, z = 4.2) => t <= 0 ? 0 : 1 - Math.exp(-z * t) * Math.cos(k * t);   // overshoot
+const sp = (f, a, dur = 30, k, z) => spring(Math.max(0, (f - a) / dur) * 3, k, z);
+function circle(x, y, r, col) { g.fillStyle = col; g.beginPath(); g.arc(x, y, Math.max(0, r), 0, 7); g.fill(); }
+function rrect(x, y, w, h, r) { r = Math.min(r, w / 2, h / 2); g.beginPath(); g.roundRect(x, y, w, h, r); }
+function text(s, x, y, size, weight = 800, col = C.paper, align = 'left', track = 0) {
+  g.font = `${weight} ${size}px ${FONT}`; g.fillStyle = col; g.textAlign = align; g.textBaseline = 'alphabetic';
+  g.letterSpacing = track + 'px'; g.fillText(s, x, y); g.letterSpacing = '0px'; }
+
+// ---------- S1 0–120: "motion" + tittle ----------
+function s1(f) {
+  const size = 400; g.font = `800 ${size}px ${FONT}`; g.letterSpacing = '-12px';
+  const parts = ['m', 'o', 't', 'ı', 'o', 'n']; const ws = parts.map(p => g.measureText(p).width - 12);
+  const total = ws.reduce((a, b) => a + b, 0); const base = 640;
+  let x = CX - total / 2; const xs = parts.map((p, i) => { const v = x; x += ws[i]; return v; });
+  const xh = g.measureText('ı').actualBoundingBoxAscent; g.letterSpacing = '0px';
+  const pop = T.events.dot_pop;
+  // letters breathe, then drop out staggered (leave fast)
+  parts.forEach((p, i) => {
+    const d = pop + 4 + Math.abs(i - 3) * 3; const out = eIn(prog(f, d, d + 22));
+    const breathe = Math.sin(f / 14 + i * 0.9) * 7;
+    g.save(); g.beginPath(); g.rect(0, 0, W, base + 40); g.clip();
+    text(p, xs[i], base + out * 520 + breathe, size, 800, C.paper, 'left', -12); g.restore();
+  });
+  // label
+  const la = 1 - prog(f, pop, pop + 10);
+  g.globalAlpha = la; text('A FILM ABOUT ONE DOT', 120, 170, 34, 600, '#BDBDC6', 'left', 6); g.globalAlpha = 1;
+  // the tittle
+  const tx = xs[3] + ws[3] / 2, r0 = 36, ty = base - xh - r0 - 26;
+  const ant = prog(f, pop - 14, pop);                     // anticipation squash
+  const t = prog(f, pop, pop + 26), a = eOut(t);
+  const px = lerp(tx, CX, a), py = lerp(ty, CY, a) - Math.sin(Math.PI * t) * 260;   // arc
+  const r = lerp(r0 * (1 + 0.12 * Math.sin(f / 7) * (1 - prog(f, pop - 16, pop))), 90, sp(f, pop + 6, 24));
+  const sq = f < pop ? 1 - 0.3 * Math.sin(Math.PI * ant * 0.5) * (ant) : 1 + 0.25 * Math.sin(Math.PI * clamp(t * 2)) ;
+  g.save(); g.translate(f < pop ? px : px, f < pop ? py + r0 * (1 - sq) : py); g.scale(1 / Math.sqrt(sq) , sq);
+  circle(0, 0, r, C.coral); g.restore();
+  return { r };
+}
+
+// ---------- S2 120–240: shape morphs ----------
+const polyR = (th, n, R) => { const s = 2 * Math.PI / n, a = ((th % s) + s) % s - s / 2; return R * Math.cos(Math.PI / n) / Math.cos(a); };
+const starR = (th, R) => { const s = 2 * Math.PI / 5, a = Math.abs((((th + Math.PI / 2) % s) + s) % s - s / 2) / (s / 2); return R * lerp(0.48, 1.12, a ** 1.4); };
+const sqR = (th, R) => { const p = 5, c = Math.abs(Math.cos(th)) ** p, s = Math.abs(Math.sin(th)) ** p; return R / (c + s) ** (1 / p); };
+function shapeR(i, th, R) { return [() => R, () => polyR(th + Math.PI / 2, 3, R * 1.15), () => starR(th, R * 1.1), () => sqR(th, R * 0.92)][i](); }
+function shapePath(f, R) {
+  const m = T.events.morphs; const ks = [m[0] - 30 + 0, m[0], m[1], m[2]];
+  let idx = 0, w = 0; for (let k = 1; k < 4; k++) { const p = sp(f, m[k - 1] - 6, 22, 9, 4); if (f >= m[k - 1] - 6) { idx = k - 1; w = p; } }
+  const pts = []; for (let j = 0; j < 180; j++) { const th = j / 180 * Math.PI * 2;
+    const r = lerp(shapeR(idx, th, R), shapeR(idx + 1, th, R), w); pts.push([Math.cos(th) * r, Math.sin(th) * r]); }
+  return pts;
+}
+function drawPts(pts) { g.beginPath(); pts.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath(); }
+function s2(f) {
+  const m = T.events.morphs; const R = lerp(90, 220, eOut(prog(f, 120, 150))) * lerp(1, 0.818, eIO(prog(f, 222, 240)));
+  const rot = (m.reduce((a, t) => a + sp(f, t - 6, 22, 9, 4), 0)) * (Math.PI / 3) + f * 0.002;
+  const rotFix = rot - (Math.PI / 3) * 3 * eIO(prog(f, 222, 240)) - f * 0.002 * eIO(prog(f, 222, 240));
+  // echoes: earlier frames, outlined (overlapping secondary motion)
+  for (let e = 3; e >= 1; e--) { const fe = f - e * 4; if (fe < 132) continue;
+    g.save(); g.translate(CX, CY); g.rotate(rot - e * 0.06); drawPts(shapePath(fe, R * (1 + e * 0.08)));
+    g.strokeStyle = C.coral; g.globalAlpha = 0.28 / e * (1 - prog(f, 215, 235)); g.lineWidth = 3; g.stroke(); g.restore(); }
+  g.save(); g.translate(CX, CY); g.rotate(rotFix); drawPts(shapePath(f, R)); g.fillStyle = C.coral; g.fill(); g.restore();
+  // counter, small and quiet
+  const idx = m.filter(t => f >= t - 6).length;
+  g.globalAlpha = prog(f, 130, 140) * (1 - prog(f, 225, 235));
+  text(['CIRCLE', 'TRIANGLE', 'STAR', 'SQUARE'][idx], 120, 960, 34, 600, '#BDBDC6', 'left', 6);
+  text(`0${idx + 1} / 04`, W - 120, 960, 34, 600, '#BDBDC6', 'right', 6); g.globalAlpha = 1;
+}
+
+// ---------- S3 240–360: UI ----------
+function cursorAt(x, y, press) { g.save(); g.translate(x, y); g.scale(1.6 - press * 0.15, 1.6 - press * 0.15);
+  g.beginPath(); g.moveTo(0, 0); g.lineTo(0, 22); g.lineTo(6, 17); g.lineTo(10, 26); g.lineTo(14, 24); g.lineTo(10, 15); g.lineTo(17, 15); g.closePath();
+  g.fillStyle = C.ink; g.fill(); g.strokeStyle = C.paper; g.lineWidth = 1.5; g.stroke(); g.restore(); }
+function s3(f) {
+  const [c1, c2, c3] = T.events.ui_clicks, lift = T.events.knob_lift;
+  const build = eOut(prog(f, 244, 270)), sink = eIn(prog(f, lift, lift + 22));
+  const cw = 900, ch = 500, cx = CX - 420, cy = CY - 250;
+  // card (perspective-ish sink: squash height, drop, fade)
+  g.save(); g.translate(CX, CY + sink * 260 + Math.sin(f / 12) * 6); g.scale(lerp(0.9, 1, build) * (1 - sink * 0.25), lerp(0.9, 1, build) * (1 - sink * 0.75)); g.translate(-CX, -CY);
+  g.globalAlpha = build * (1 - sink);
+  rrect(cx, cy, cw, ch, 40); g.fillStyle = C.paper; g.fill();
+  const lab = (s, y, i) => { const a = eOut(prog(f, 252 + i * 5, 272 + i * 5)); g.save(); g.globalAlpha *= a;
+    text(s, cx + 64, y + 14 + (1 - a) * 20, 40, 700, C.ink); g.restore(); };
+  lab('Speed', CY - 150, 0); lab('Motion', CY, 1); lab('Render', CY + 150, 2);
+  // slider (row 1): dragged on c2
+  const sv = lerp(0.25, 0.9, eIO(prog(f, c2, c2 + 16)));
+  const sx = 900 - 120, sw = 440;
+  rrect(sx, CY - 158, sw, 16, 8); g.fillStyle = '#DAD6CD'; g.fill();
+  rrect(sx, CY - 158, sw * sv, 16, 8); g.fillStyle = C.cobalt; g.fill();
+  g.beginPath(); g.arc(sx + sw * sv, CY - 150, 22 + 4 * Math.sin(Math.PI * prog(f, c2, c2 + 16)), 0, 7); g.fillStyle = C.cobalt; g.fill();
+  // toggle track (row 2) — knob is the carrier, drawn later outside the card transform
+  const on = sp(f, c1, 18, 10, 5);
+  rrect(900, CY - 60, 280, 120, 60); g.fillStyle = '#DAD6CD'; g.fill();
+  g.save(); g.globalAlpha *= clamp(on); rrect(900, CY - 60, 280, 120, 60); g.fillStyle = C.mint; g.fill(); g.restore();
+  // ring (row 3): fills after c3
+  const rp = eOut(prog(f, c3, c3 + 14));
+  g.lineWidth = 12; g.strokeStyle = '#DAD6CD'; g.beginPath(); g.arc(1120, CY + 150, 34, 0, 7); g.stroke();
+  g.strokeStyle = C.ink; g.lineCap = 'round'; g.beginPath(); g.arc(1120, CY + 150, 34, -Math.PI / 2, -Math.PI / 2 + rp * Math.PI * 2 * 0.999); if (rp > 0) g.stroke();
+  text(rp >= 1 ? 'Done' : `${Math.round(rp * 100)}%`, 1060, CY + 164, 34, 700, C.ink, 'right');
+  text(on > 0.5 ? 'On' : 'Off', 1240, CY + 14, 34, 600, '#6B6A70', 'left');
+  g.restore();
+  // cursor path: knob → slider → ring, presses at clicks
+  const path = [[1340, 820, 248], [1010, CY + 10, c1 - 4], [1010, CY + 10, c1 + 4], [sx + sw * 0.25 + 4, CY - 146, c2 - 2], [sx + sw * 0.9 + 4, CY - 146, c2 + 16], [1124, CY + 154, c3 - 2], [1124, CY + 154, c3 + 6], [1500, 900, lift + 12]];
+  let cx2 = path[0][0], cy2 = path[0][1];
+  for (let i = 1; i < path.length; i++) { const p = prog(f, path[i - 1][2], path[i][2]); const e = i === 4 ? eIO(prog(f, c2, c2 + 16)) : eIO(p);
+    if (f >= path[i - 1][2]) { cx2 = lerp(path[i - 1][0], path[i][0], e); cy2 = lerp(path[i - 1][1], path[i][1], e) - Math.sin(Math.PI * e) * (i === 4 ? 0 : 40); } }
+  const press = Math.max(...[c1, c2, c3].map(c => 1 - Math.abs(f - c) / 4)).toFixed ? Math.max(0, ...[c1, c2, c3].map(c => 1 - Math.abs(f - c) / 4)) : 0;
+  const ca = prog(f, 250, 258) * (1 - prog(f, lift, lift + 8));
+  // knob = carrier: from 180px square (centre) → knob → lifts back to centre as 180 square
+  const shrink = eOut(prog(f, 240, 262)), slide = on, back = eIO(prog(f, lift - 10, lift + 4));
+  let kx = lerp(CX, lerp(960, 1120, slide), shrink); kx = lerp(kx, CX, eIO(prog(f, lift - 2, lift + 14)));
+  let ks = lerp(180, 104, shrink); ks = lerp(ks, 180, eOut(prog(f, lift, lift + 14)));
+  const kr = lerp(lerp(30, 52, shrink), 22, eOut(prog(f, lift, lift + 14)));
+  const ky = CY - Math.sin(Math.PI * prog(f, lift, lift + 14)) * 60;
+  g.save(); g.shadowColor = 'rgba(0,0,0,.35)'; g.shadowBlur = 30 * shrink; g.shadowOffsetY = 10 * shrink;
+  rrect(kx - ks / 2, ky - ks / 2, ks, ks, kr); g.fillStyle = C.coral; g.fill(); g.restore();
+  if (ca > 0) { g.globalAlpha = ca; cursorAt(cx2, cy2, press); g.globalAlpha = 1; }
+}
+
+// ---------- S4 360–480: cube ----------
+function project(p, yaw, pitch, scale, ox, oy) {
+  let [x, y, z] = p; const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  [x, z] = [x * cy - z * sy, x * sy + z * cy];
+  const cp = Math.cos(pitch), spp = Math.sin(pitch); [y, z] = [y * cp - z * spp, y * spp + z * cp];
+  const d = 1400, k = d / (d + z); return [ox + x * k * scale, oy + y * k * scale, z]; }
+function shade(hex, l) { const n = parseInt(hex.slice(1), 16); let r = n >> 16, gg = n >> 8 & 255, b = n & 255;
+  const m = v => Math.round(clamp(l < 1 ? v * l : v + (255 - v) * (l - 1), 0, 255)); return `rgb(${m(r)},${m(gg)},${m(b)})`; }
+function cube(f, squash = 0) {
+  const t = prog(f, 360, 400), e = eOut(t);
+  const yaw = lerp(0, 0.62, e) + Math.max(0, f - 380) * 0.02;          // held breath: slow drift
+  const pitch = lerp(0, -0.62, e);
+  const S = 90; const sy = 1 - squash * 0.45, sxz = 1 + squash * 0.3;
+  const oy = CY + lerp(0, 60, e) + squash * S * 0.8;
+  const V = [[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1], [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]].map(([x, y, z]) => [x * S * sxz, y * S * sy, z * S * sxz]);
+  const P = V.map(v => project(v, yaw, pitch, 1, CX, oy));
+  // floor shadow
+  const fl = CY + lerp(90, 60 + S * 1.55, e) + squash * S * 0.2;
+  g.save(); g.globalAlpha = 0.55 * e; const grd = g.createRadialGradient(CX, fl, 0, CX, fl, 260 * sxz);
+  grd.addColorStop(0, 'rgba(0,0,0,.9)'); grd.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = grd; g.scale(1, 0.28); g.beginPath(); g.arc(CX, fl / 0.28, 260 * sxz, 0, 7); g.fill(); g.restore();
+  const faces = [[0, 1, 2, 3, 1.0], [4, 5, 6, 7, 0.6], [0, 1, 5, 4, 1.32], [3, 2, 6, 7, 0.5], [0, 3, 7, 4, 0.72], [1, 2, 6, 5, 0.86]];
+  faces.map(fc => ({ fc, z: fc.slice(0, 4).reduce((a, i) => a + P[i][2], 0) })).sort((a, b) => b.z - a.z).forEach(({ fc }) => {
+    g.beginPath(); fc.slice(0, 4).forEach((i, k) => k ? g.lineTo(P[i][0], P[i][1]) : g.moveTo(P[i][0], P[i][1])); g.closePath();
+    g.fillStyle = shade(C.coral, fc[4]); g.fill(); g.strokeStyle = shade(C.coral, fc[4] * 1.05); g.lineWidth = 1; g.stroke(); });
+  return P;
+}
+function s4(f) {
+  const squash = Math.sin(Math.PI * 0.5 * prog(f, T.events.cube_squash - 8, T.events.drop)) ** 2;
+  const P = cube(f, squash);
+  // tracked HTML-style label on the top-front-right corner
+  const la = prog(f, 404, 416) * (1 - prog(f, 462, 470)); if (la <= 0) return;
+  const [vx, vy] = P[1]; const lx = vx + 140, ly = vy - 90;
+  g.globalAlpha = la; g.strokeStyle = C.paper; g.lineWidth = 2; g.beginPath(); g.moveTo(vx, vy); g.lineTo(vx + 140 * eOut(la), vy - 90 * eOut(la)); g.stroke();
+  circle(vx, vy, 6, C.paper); text('SAME SQUARE, ONE MORE AXIS', lx + 12, ly + 10, 32, 600, C.paper, 'left', 4); g.globalAlpha = 1;
+  text('Z', CX - 520, CY + 330, 34, 600, '#BDBDC6');
+}
+
+// ---------- metaballs (S5) ----------
+const mb = document.createElement("canvas"), MS = 2; mb.width = W / MS; mb.height = H / MS; const mg = mb.getContext('2d');
+const img = mg.createImageData(mb.width, mb.height);
+function metaballs(balls, col = [255, 90, 60]) {
+  const w = mb.width, h = mb.height, d = img.data;
+  const bs = balls.map(b => [b.x / MS, b.y / MS, (b.r / MS) ** 2, b.sy || 1]);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0; for (const [bx, by, r2, sy] of bs) { const dx = x - bx, dy = (y - by) / sy; s += r2 / (dx * dx + dy * dy + 1e-3); }
+    const a = clamp((s - 0.98) / 0.035), i = (y * w + x) * 4;
+    const hl = clamp((s - 1.6) / 3) * 0.18;               // soft inner highlight
+    d[i] = col[0] + (255 - col[0]) * hl; d[i + 1] = col[1] + (255 - col[1]) * hl; d[i + 2] = col[2] + (255 - col[2]) * hl; d[i + 3] = a * 255; }
+  mg.putImageData(img, 0, 0); g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high'; g.drawImage(mb, 0, 0, W, H); }
+const FLOOR = 800;
+const drops = [...Array(7)].map((_, i) => ({ vx: (i - 3) * 135 + (i % 2 ? 22 : -18), r: [70, 54, 62, 84, 58, 66, 50][i], h: [380, 300, 420, 340, 400, 280, 360][i], ph: i % 2 }));
+function dropState(f) {
+  const d0 = T.dropFrame, pool = T.events.pool, bf = 30;
+  const spread = eOut(prog(f, d0 + 2, d0 + 40)), gather = eIO(prog(f, pool - 40, pool));
+  return drops.map((d, i) => {
+    const tt = (f - d0 - 6 - d.ph * 15) / bf;            // bounces land on beats (alt drops on off-beats)
+    const amp = d.h * Math.exp(-Math.max(0, tt) * 0.25);
+    const y = FLOOR - d.r * 0.85 - Math.abs(Math.sin(Math.PI * Math.max(0, tt))) * amp * spread;
+    const contact = 1 - Math.min(1, Math.abs(Math.sin(Math.PI * Math.max(0, tt))) * 6);
+    return { x: CX + d.vx * spread * (1 - gather), y: lerp(y, FLOOR - 70, gather), r: d.r * lerp(1, 0.9, gather), sy: 1 - 0.3 * contact * spread * (1 - gather) };
+  });
+}
+function s5(f) {
+  const d0 = T.dropFrame; const melt = prog(f, d0, d0 + 10);
+  const balls = dropState(f);
+  // one big ball at the cube's footprint melts into the set
+  const big = { x: CX, y: lerp(CY + 120, FLOOR - 60, eOut(melt)), r: lerp(190, 0, eOut(prog(f, d0 + 2, d0 + 30))), sy: lerp(0.7, 0.4, melt) };
+  // pool spreading as everything gathers (and hands off to S6)
+  const pool = T.events.pool; const pp = prog(f, pool - 12, pool);
+  const all = [big, ...balls].filter(b => b.r > 1);
+  if (pp > 0) all.push({ x: CX, y: FLOOR - 50, r: 140 * eOut(pp), sy: 0.45 });
+  // floor line
+  g.strokeStyle = '#2C2E36'; g.lineWidth = 2; g.beginPath(); g.moveTo(120, FLOOR + 2); g.lineTo(W - 120, FLOOR + 2); g.stroke();
+  metaballs(all);
+  if (f < d0 + 3) { g.globalAlpha = 1 - prog(f, d0, d0 + 3); cube(d0, 1); g.globalAlpha = 1; }
+}
+
+// ---------- S6 660–780: overhead ripple grid ----------
+function s6(f) {
+  const p0 = T.events.pool, col = T.events.ripple_collapse;
+  const tilt = eOut(prog(f, p0, p0 + 26));                 // camera swings overhead: floor line → grid plane
+  const cols = 31, rows = 17, gap = 58;
+  const centerY = lerp(FLOOR - 50, CY, tilt);
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const gx = CX + (i - (cols - 1) / 2) * gap, gyFlat = CY + (j - (rows - 1) / 2) * gap;
+    const gy = lerp(FLOOR - 50 + (gyFlat - CY) * 0.08, gyFlat, tilt);
+    const dist = Math.hypot(gx - CX, gyFlat - CY);
+    const tt = (f - p0) / 60;
+    const front = tt * 1500;                                  // ripple front speed px/s
+    const env = (Math.exp(-((dist - front) ** 2) / (2 * 220 ** 2)) + 0.7 * Math.exp(-((dist - front + 500) ** 2) / (2 * 160 ** 2))) * Math.exp(-tt * 0.3);
+    const wave = Math.sin(dist / 55 - tt * 9) * env;
+    const appear = prog(front - dist, -60, 40);
+    const c = eIO(prog(f, col + dist / 30, col + dist / 30 + 22));   // collapse, nearest first
+    const x = lerp(gx, CX, c), y = lerp(gy, CY, c);
+    let r = (4.5 + 16 * Math.max(0, wave) + 2 * Math.sin(f / 9 + i * .3 + j * .5) * 0.5) * appear * (1 - c * 0.9);
+    if (r <= 0.2) continue;
+    g.fillStyle = wave < -0.15 ? C.cobalt : (wave > 0.25 ? C.coral : '#8A8C98'); g.globalAlpha = 1 - c * 0.85;
+    g.beginPath(); g.arc(x, y, r, 0, 7); g.fill();
+  }
+  g.globalAlpha = 1;
+  // the pool blob shrinks to the carrier dot at centre
+  const pr = lerp(140, 0, eIn(prog(f, p0, p0 + 18)));
+  if (pr > 1) { g.save(); g.translate(CX, centerY); g.scale(1, lerp(0.45, 1, tilt)); circle(0, 0, pr, C.coral); g.restore(); }
+  const dr = lerp(0, 40, eOut(prog(f, col + 18, col + 40))) + (f > p0 + 6 ? 10 * Math.max(0, Math.sin((f - p0) / 30 * Math.PI * 2)) * (1 - prog(f, col, col + 20)) : 0);
+  circle(CX, centerY, Math.max(f > p0 + 4 ? 12 : 0, dr), C.coral);
+}
+
+// ---------- S7 780–900: sign-off ----------
+function s7(f) {
+  const words = ['made', 'in', 'code']; const wt = T.events.type_words; const size = 210;
+  g.font = `800 ${size}px ${FONT}`; g.letterSpacing = '-6px';
+  const ws = words.map(w => g.measureText(w).width), sp_ = 56, dotW = 70;
+  const total = ws.reduce((a, b) => a + b, 0) + sp_ * 2 + dotW; g.letterSpacing = '0px';
+  const drift = (f - 780) * 0.06;                          // micro-motion on the hold
+  let x = CX - total / 2 - drift / 2, base = CY + 70;
+  words.forEach((w, i) => { const p = eOut(prog(f, wt[i] - 4, wt[i] + 16));
+    g.save(); g.beginPath(); g.rect(x - 20, base - size, ws[i] + 40, size + 60); g.clip();
+    text(w, x + i * drift * 0.5, base + (1 - p) * size * 1.1, size, 800, C.paper, 'left', -6); g.restore(); x += ws[i] + sp_; });
+  // the dot lands as the full stop
+  const end = T.events.end_hit; const dx = x - sp_ + 40 + drift, dy = base - 30;
+  const t = prog(f, 780, end), e = eIO(t);
+  const px = lerp(CX, dx, e), py = lerp(CY, dy, e) - Math.sin(Math.PI * t) * 200;
+  const land = f >= end ? 1 + 0.35 * Math.exp(-(f - end) / 5) * Math.cos((f - end) / 3) : 1;
+  const r = lerp(40, 30, e) * (1 + 0.04 * Math.sin((f - end) / 15 * Math.PI) * (f > end + 20 ? 1 : 0));
+  g.save(); g.translate(px, py + (land - 1) * 20); g.scale(land, 1 / land); circle(0, 0, r, C.coral); g.restore();
+  const sa = eOut(prog(f, end + 18, end + 36));
+  g.globalAlpha = sa; text('ONE DOT  ·  900 FRAMES  ·  60 FPS  ·  NO TIMERS', CX, base + 150 + (1 - sa) * 16, 34, 600, '#BDBDC6', 'center', 6); g.globalAlpha = 1;
+}
+
+// ---------- timeline ----------
+function draw(f) {
+  g.fillStyle = C.ink; g.fillRect(0, 0, W, H);
+  if (f < 120) s1(f);
+  else if (f < 240) s2(f);
+  else if (f < 360) s3(f);
+  else if (f < 480) s4(f);
+  else if (f < 660) s5(f);
+  else if (f < 780) s6(f);
+  else s7(f);
+}
+// 180° shutter: average 4 subframes (equal weights via progressive alpha)
+window.renderFrame = (f, samples = 4) => {
+  out.globalAlpha = 1;
+  for (let i = 0; i < samples; i++) { draw(f + (i / samples - 0.5) * 0.5); out.globalAlpha = 1 / (i + 1); out.drawImage(buf, 0, 0); }
+  out.globalAlpha = 1; };
+window.setTiming = t => { T = t; };
+</script></body></html>
